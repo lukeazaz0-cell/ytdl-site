@@ -1,4 +1,5 @@
 const http = require("node:http");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -85,49 +86,126 @@ async function handleInfo(req, res) {
   });
 }
 
-function handleDownload(req, res, params) {
-  const url = (params.get("url") || "").trim();
-  const format = params.get("format") || "b";
-  if (!validUrl(url)) {
-    res.writeHead(400, { "Content-Type": "text/plain" });
-    return res.end("Invalid URL");
-  }
+// Downloads run as background jobs so no single request outlives a proxy timeout (e.g. Cloudflare's 100s):
+// the page starts a job, polls its progress, then fetches the finished file.
+const jobs = new Map();
+const JOB_TTL = 60 * 60 * 1000; // finished files are kept for an hour
+const MAX_RUNNING = 5;
+const PROGRESS = "download:[progress] %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s %(progress.speed)s %(progress.eta)s";
 
-  const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), "ytdl-"));
-  const cleanup = () => fs.rm(tmpdir, { recursive: true, force: true }, () => {});
-  const args = ["-f", format, "--no-playlist", "--no-warnings", "-o", path.join(tmpdir, "%(title).150B [%(id)s].%(ext)s"), "--", url];
-  const child = spawn(YTDLP, args);
-  let stderr = "";
-  child.stderr.on("data", (chunk) => (stderr += chunk));
-  child.on("error", (err) => (stderr += err.message));
-  child.on("close", (code) => {
-    const name = code === 0 && fs.readdirSync(tmpdir)[0];
-    if (!name) {
-      cleanup();
-      res.writeHead(500, { "Content-Type": "text/plain" });
-      return res.end(`Download failed: ${cleanError(stderr)}`);
-    }
-    const file = path.join(tmpdir, name);
-    res.writeHead(200, {
-      "Content-Type": "application/octet-stream",
-      "Content-Length": fs.statSync(file).size,
-      "Content-Disposition": `attachment; filename="${name.replace(/[^\x20-\x7e]|"/g, "_")}"; filename*=UTF-8''${encodeURIComponent(name)}`,
-    });
-    fs.createReadStream(file).pipe(res).on("close", cleanup);
-  });
-  res.on("close", () => {
-    if (!res.headersSent) child.kill(); // client gave up before the file was ready
+function publicJob(job) {
+  const { status, percent, part, parts, speed, eta, error } = job;
+  return { status, percent, part, parts, speed, eta, error, file: job.name };
+}
+
+function removeJob(id) {
+  const job = jobs.get(id);
+  if (!job) return;
+  if (job.child) job.child.kill();
+  fs.rm(job.dir, { recursive: true, force: true }, () => {});
+  jobs.delete(id);
+}
+
+setInterval(() => {
+  for (const [id, job] of jobs) if (Date.now() - job.updated > JOB_TTL) removeJob(id);
+}, 5 * 60 * 1000).unref();
+
+function onOutput(job, line) {
+  job.updated = Date.now();
+  if (line.startsWith("[download] Destination:")) {
+    job.part = Math.min(job.part + 1, job.parts);
+    job.percent = 0;
+  } else if (line.startsWith("[progress] ")) {
+    const [done, total, estimate, speed, eta] = line.slice(11).split(" ").map(Number);
+    const size = total || estimate;
+    if (size) job.percent = Math.min(100, Math.round((done / size) * 1000) / 10);
+    job.speed = speed || null;
+    job.eta = Number.isFinite(eta) ? eta : null;
+  } else if (/^\[(Merger|ExtractAudio|VideoConvertor|Fixup\w*|FFmpeg\w*)\]/.test(line)) {
+    job.status = "processing";
+  }
+}
+
+function lines(stream, fn) {
+  let buf = "";
+  stream.on("data", (chunk) => {
+    buf += chunk;
+    const parts = buf.split(/\r?\n|\r/);
+    buf = parts.pop();
+    parts.forEach(fn);
   });
 }
 
+async function handleStartJob(req, res) {
+  let body = {};
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {}
+  const url = String(body.url || "").trim();
+  const format = String(body.format || "b");
+  if (!validUrl(url)) return sendJson(res, 400, { error: "Please enter a valid YouTube URL." });
+  if ([...jobs.values()].filter((j) => j.status === "downloading" || j.status === "processing").length >= MAX_RUNNING) {
+    return sendJson(res, 429, { error: "The server is busy, try again in a minute." });
+  }
+
+  const id = crypto.randomUUID();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ytdl-"));
+  const job = { dir, status: "downloading", percent: 0, part: 0, parts: format.includes("+") ? 2 : 1, updated: Date.now() };
+  jobs.set(id, job);
+
+  const args = [
+    "-f", format, "--no-playlist", "--no-warnings", "--newline", "--progress-template", PROGRESS,
+    "-o", path.join(dir, "%(title).150B [%(id)s].%(ext)s"), "--", url,
+  ];
+  const child = (job.child = spawn(YTDLP, args));
+  let stderr = "";
+  lines(child.stdout, (line) => onOutput(job, line));
+  child.stderr.on("data", (chunk) => (stderr = (stderr + chunk).slice(-10_000)));
+  child.on("error", (err) => (stderr += err.message));
+  child.on("close", (code) => {
+    job.child = null;
+    job.updated = Date.now();
+    const name = code === 0 && fs.readdirSync(dir).find((f) => !f.endsWith(".part") && !f.endsWith(".ytdl"));
+    if (name) Object.assign(job, { status: "done", percent: 100, name, path: path.join(dir, name) });
+    else Object.assign(job, { status: "error", error: cleanError(stderr) });
+  });
+
+  sendJson(res, 202, { id });
+}
+
+function handleJobFile(req, res, job) {
+  if (!job || job.status !== "done") {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    return res.end("File not found or expired.");
+  }
+  job.updated = Date.now();
+  res.writeHead(200, {
+    "Content-Type": "application/octet-stream",
+    "Content-Length": fs.statSync(job.path).size,
+    "Content-Disposition": `attachment; filename="${job.name.replace(/[^\x20-\x7e]|"/g, "_")}"; filename*=UTF-8''${encodeURIComponent(job.name)}`,
+  });
+  fs.createReadStream(job.path).pipe(res);
+}
+
 const server = http.createServer((req, res) => {
-  const { pathname, searchParams } = new URL(req.url, "http://localhost");
+  const { pathname } = new URL(req.url, "http://localhost");
   if (req.method === "GET" && pathname === "/") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     return res.end(INDEX);
   }
   if (req.method === "POST" && pathname === "/api/info") return handleInfo(req, res);
-  if (req.method === "GET" && pathname === "/api/download") return handleDownload(req, res, searchParams);
+  if (req.method === "POST" && pathname === "/api/jobs") return handleStartJob(req, res);
+  const match = pathname.match(/^\/api\/jobs\/([\w-]+)(\/file)?$/);
+  if (match && req.method === "GET") {
+    const job = jobs.get(match[1]);
+    if (match[2]) return handleJobFile(req, res, job);
+    return job ? sendJson(res, 200, publicJob(job)) : sendJson(res, 404, { error: "Job not found or expired." });
+  }
+  if (match && req.method === "DELETE") {
+    removeJob(match[1]);
+    res.writeHead(204);
+    return res.end();
+  }
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("Not found");
 });

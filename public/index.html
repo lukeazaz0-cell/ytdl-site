@@ -36,10 +36,21 @@
             <p id="meta" class="card-subtitle text-body-secondary mb-3"></p>
             <div class="input-group">
               <select id="format" class="form-select"></select>
-              <a id="download" class="btn btn-success" href="#">Download</a>
+              <button id="download" class="btn btn-success" type="button">Download</button>
             </div>
-            <div id="preparing" class="form-text d-none">
-              Preparing your file on the server — the download starts when it's ready.
+
+            <div id="job" class="mt-3 d-none">
+              <div class="d-flex justify-content-between small mb-1">
+                <span id="job-status">Starting…</span>
+                <span id="job-detail" class="text-body-secondary"></span>
+              </div>
+              <div class="progress" role="progressbar" aria-label="Download progress">
+                <div id="job-bar" class="progress-bar progress-bar-striped progress-bar-animated" style="width: 0%"></div>
+              </div>
+              <div class="d-flex justify-content-between align-items-center mt-2">
+                <span class="form-text m-0">The file is prepared on the server first, then your download starts automatically.</span>
+                <button id="cancel" class="btn btn-sm btn-outline-secondary ms-2" type="button">Cancel</button>
+              </div>
             </div>
           </div>
         </div>
@@ -61,16 +72,89 @@
       $("error").classList.toggle("d-none", !msg);
     }
 
-    function updateLink() {
-      const params = new URLSearchParams({ url: currentUrl, format: $("format").value });
-      $("download").href = "/api/download?" + params;
+    let jobId = null;
+
+    const fmtBytes = (n) => n >= 1048576 ? (n / 1048576).toFixed(1) + " MB/s" : Math.round(n / 1024) + " KB/s";
+    const fmtEta = (s) => s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s left` : `${s}s left`;
+
+    function setBar(percent, text, detail = "", color = "") {
+      $("job-bar").style.width = percent + "%";
+      $("job-bar").className = "progress-bar" + (percent < 100 && !color ? " progress-bar-striped progress-bar-animated" : "") + (color ? " bg-" + color : "");
+      $("job-status").textContent = text;
+      $("job-detail").textContent = detail;
+    }
+
+    function resetJob() {
+      jobId = null;
+      $("job").classList.add("d-none");
+      $("download").disabled = false;
+      $("format").disabled = false;
+    }
+
+    async function startJob() {
+      showError("");
+      $("download").disabled = true;
+      $("format").disabled = true;
+      $("cancel").classList.remove("d-none");
+      $("job").classList.remove("d-none");
+      setBar(0, "Starting…");
+      try {
+        const res = await fetch("/api/jobs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: currentUrl, format: $("format").value }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Could not start the download.");
+        jobId = data.id;
+        poll(jobId);
+      } catch (err) {
+        resetJob();
+        showError(err.message);
+      }
+    }
+
+    async function poll(id) {
+      if (id !== jobId) return; // cancelled or replaced
+      let job;
+      try {
+        const res = await fetch("/api/jobs/" + id);
+        job = await res.json();
+        if (!res.ok) throw new Error(job.error);
+      } catch (err) {
+        if (id !== jobId) return;
+        resetJob();
+        return showError(err.message || "Lost track of the download.");
+      }
+      if (id !== jobId) return;
+
+      if (job.status === "downloading") {
+        const part = job.parts > 1 ? ` (part ${Math.max(job.part, 1)} of ${job.parts})` : "";
+        const detail = [job.speed && fmtBytes(job.speed), job.eta != null && fmtEta(job.eta)].filter(Boolean).join(" · ");
+        setBar(job.percent, `Downloading on server${part} — ${job.percent}%`, detail);
+      } else if (job.status === "processing") {
+        setBar(100, "Merging / converting…");
+      } else if (job.status === "done") {
+        setBar(100, "Ready — your download is starting", job.file, "success");
+        $("cancel").classList.add("d-none");
+        $("download").disabled = false;
+        $("format").disabled = false;
+        jobId = null;
+        location.href = `/api/jobs/${id}/file`;
+        return;
+      } else if (job.status === "error") {
+        resetJob();
+        return showError(job.error || "Download failed.");
+      }
+      setTimeout(() => poll(id), 1000);
     }
 
     $("lookup").addEventListener("submit", async (e) => {
       e.preventDefault();
       showError("");
       $("result").classList.add("d-none");
-      $("preparing").classList.add("d-none");
+      if (jobId) fetch("/api/jobs/" + jobId, { method: "DELETE" });
+      resetJob();
       setLoading(true);
       try {
         currentUrl = $("url").value.trim();
@@ -83,10 +167,10 @@
         if (!res.ok) throw new Error(data.error || "Something went wrong.");
 
         $("thumb").src = data.thumbnail || "";
+        $("thumb").parentElement.classList.toggle("d-none", !data.thumbnail);
         $("title").textContent = data.title;
         $("meta").textContent = [data.uploader, data.duration].filter(Boolean).join(" · ");
         $("format").replaceChildren(...data.formats.map((f) => new Option(f.label, f.id)));
-        updateLink();
         $("result").classList.remove("d-none");
       } catch (err) {
         showError(err.message);
@@ -95,8 +179,11 @@
       }
     });
 
-    $("format").addEventListener("change", updateLink);
-    $("download").addEventListener("click", () => $("preparing").classList.remove("d-none"));
+    $("download").addEventListener("click", startJob);
+    $("cancel").addEventListener("click", () => {
+      if (jobId) fetch("/api/jobs/" + jobId, { method: "DELETE" });
+      resetJob();
+    });
   </script>
 </body>
 </html>
