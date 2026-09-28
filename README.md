@@ -7,7 +7,7 @@ A minimal YouTube downloader: a zero-dependency Node server that shells out to [
 ## Requirements
 
 - Node 18+
-- `yt-dlp` on your `PATH` (`pip install yt-dlp`, `brew install yt-dlp`, or grab a binary from its releases page). Set `YTDLP=/path/to/yt-dlp` to use a specific one.
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp): nothing to do. If it isn't on your `PATH`, the server downloads the official standalone build for your OS into `bin/` on first start. Set `YTDLP=/path/to/yt-dlp` to use a specific one.
 - Optional: [ffmpeg](https://ffmpeg.org/), which unlocks the "Best quality" option (merges the best video and audio streams). Without it, only formats that already contain both, or audio-only formats, are offered.
 
 ## Run

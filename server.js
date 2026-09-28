@@ -3,9 +3,10 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { execFile, spawn, spawnSync } = require("node:child_process");
+const { findYtdlp } = require("./ytdlp");
 
 const PORT = Number(process.env.PORT) || 3000;
-const YTDLP = process.env.YTDLP || "yt-dlp";
+let YTDLP;
 const ALLOWED_HOSTS = new Set(["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"]);
 const HAS_FFMPEG = spawnSync("ffmpeg", ["-version"]).status === 0;
 const INDEX = fs.readFileSync(path.join(__dirname, "public", "index.html"));
@@ -131,4 +132,12 @@ const server = http.createServer((req, res) => {
   res.end("Not found");
 });
 
-server.listen(PORT, () => console.log(`YTDL running on http://localhost:${PORT}`));
+findYtdlp()
+  .then((bin) => {
+    YTDLP = bin;
+    server.listen(PORT, () => console.log(`YTDL running on http://localhost:${PORT} (using ${YTDLP})`));
+  })
+  .catch((err) => {
+    console.error(`Could not set up yt-dlp: ${err.message}`);
+    process.exit(1);
+  });
