@@ -1,22 +1,26 @@
 # ytdl-site
 
-A minimal YouTube downloader: Flask + [yt-dlp](https://github.com/yt-dlp/yt-dlp) on the back end, plain Bootstrap 5 on the front end (no custom CSS).
+A minimal YouTube downloader: a zero-dependency Node server that shells out to [yt-dlp](https://github.com/yt-dlp/yt-dlp), and a single page styled with plain Bootstrap 5 (no custom CSS).
+
+![screenshot](screenshot.png)
+
+## Requirements
+
+- Node 18+
+- `yt-dlp` on your `PATH` (`pip install yt-dlp`, `brew install yt-dlp`, or grab a binary from its releases page). Set `YTDLP=/path/to/yt-dlp` to use a specific one.
+- Optional: [ffmpeg](https://ffmpeg.org/), which unlocks the "Best quality" option (merges the best video and audio streams). Without it, only formats that already contain both, or audio-only formats, are offered.
 
 ## Run
 
 ```sh
-python -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-python app.py
+npm start            # or: node server.js
 ```
 
-Open http://localhost:5000, paste a YouTube link, pick a format and hit **Download**.
-
-Install [ffmpeg](https://ffmpeg.org/) to unlock the "Best quality" option (merges the best video and audio streams). Without it, only formats that already contain both, or audio-only formats, are offered.
+Open http://localhost:3000 (change with `PORT=8080 npm start`), paste a YouTube link, pick a format and hit **Download**.
 
 ## Endpoints
 
 - `POST /api/info` — `{"url": "..."}` → title, uploader, duration, thumbnail and available formats.
-- `GET /api/download?url=...&format=...` — downloads with yt-dlp to a temp dir and streams the file back.
+- `GET /api/download?url=...&format=...` — downloads with yt-dlp to a temp dir, streams the file back, then deletes it.
 
 Only YouTube URLs are accepted. Only download content you have the right to download.
